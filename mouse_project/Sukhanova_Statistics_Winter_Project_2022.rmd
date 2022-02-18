@@ -1,0 +1,423 @@
+---
+title: "Mouse_project"
+author: "Sukhanova Xenia"
+date: "02 01 2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+## Libraries downloading
+```{r}
+library(httr)
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(ggplot2)
+library(vegan)
+library(ggfortify)
+library(plotly)
+library(DESeq2)
+library(pheatmap)
+```
+## 0. Download data and describe it.
+
+We are going to find potential genes responsible for Down syndrome development in mice model and test the dependency statistically.
+
+Let's download the data (was tricky):
+
+```{r}
+#Make the link as a variable (for conviniency of reading)
+
+url <- 'https://archive.ics.uci.edu/ml/machine-learning-databases/00342/Data_Cortex_Nuclear.xls'
+GET(url, write_disk(TF <- tempfile(fileext = ".xls")))
+
+#Read data
+data <- read_excel(TF)
+```
+
+## Task 1. EDA analysis:
+
+Now lets estimate following parametres:
+1) Number of mice in the experiment;
+2) Number of complete observations;
+3) Which groups can be observed;
+4) How balanced these groups are.
+
+```{r}
+#Count mice' number:
+data2 <- data %>% separate(MouseID, into = c('MouseID', 'rep'), sep = '_')
+length(unique(data2$MouseID))
+
+#Count number of complete observations:
+table(sapply(data[,2:78], complete.cases))[2]
+
+#Group by nominal varaiables and count thier volumes and means to analyze the balance* btw groups:
+data_long <- data2 %>% pivot_longer(cols = c(3:79))
+data_long <- data_long[complete.cases(data_long$value),]
+data_long %>% group_by(Genotype, Treatment, Behavior, class) %>% na.omit() %>% summarise(total = n(), mean = mean(value), .groups = "keep")
+
+
+
+#data_l_qq$group <- paste0(data_l_qq$Genotype, data_l_qq$Treatment, data_l_qq$Behavior, data_l_qq$class, sep = '_')
+#data_l_qq$group <- paste(data_l_qq$Genotype, data_l_qq$Treatment, data_l_qq$Behavior, data_l_qq$class, sep = '_')
+#data_new <- data_l_qq
+#data_new <- data_l_qq[,c(1,2,7,8,9,10)]
+#g = unique(data_new$group
+```
+
+According to the analysis we see that there are only ***72*** mice, however the total number of complete observations is ***81764***. 
+
+To make clear which groups are presented data formatting was approached, concentrating on nominal dependent variables: Genotype, Treatment, Behaviour (or simply class variable, which includes division by mentioned three columns). In this case there are ***eight groups***.
+
+Looking at means and volumes of groups we can say that generally they are balanced, however one group significantly differs in volume which defines its weakened mean value (with more group's observations its mean could extremely differ from the rest ones).
+
+```{r}
+
+data_BDNF_N <- data_long[data_long$name=='BDNF_N',]
+#To do statistical analysis we have to check the form of distributions - for this visualisation can help:
+
+ggplot(data_BDNF_N, aes(x=value, group = class, fill =  class)) +
+    geom_density(adjust=1.5, alpha = 0.4) +
+    theme_bw() +
+    facet_wrap(~class) +
+    theme(
+        legend.position="none",
+        panel.spacing = unit(0.1, "lines"),
+        axis.ticks.x=element_blank()
+    )
+```
+
+To be more accurate statistical estimation should be provided - for this one of the method is to use shapiro test, which check if your variable has parametric or non-parametric ditridbution - for this the function is preferable to be created:
+
+```{r}
+shapiro.test_pvalue<-function(x){shapiro.test(x)$p.value}
+shapiro_data <- apply(X = data[,2:78], MARGIN = 2, FUN = shapiro.test_pvalue)
+
+```
+
+## Task 2. BDNF analysis
+
+Herein we see, that the majority of genes has non-parametric distributions, which not allows to test them with t.test or chisqueare-test. Neertheless, the statistics was gained on population - this can significantly hide deviations of subgroups (tested classes). Therefore, the shapiro test will be applied on each class to test subgroups ditributions:
+
+```{r}
+shapiro_group <- function(vars, df, gene){
+    out = as.data.frame(matrix(ncol = 1, nrow = length(vars)), row.names = vars)
+    #colnames(out) = c('p,value', 'p.adjusted.holm', 'p.adjusted.BH')
+    colnames(out) = 'shapiro_pv'
+    df = df[df$name == gene,]
+    for (i in vars){
+        #col_n = paste0('p.value_',i)
+        out[i,1] = shapiro.test_pvalue(subset(df,class==i)$value)
+        #out[i,2] = p.adjust(out[i,1], method = 'holm')
+        #out[i,3] = p.adjust(out[i,1], method = 'BH')
+    }
+    out$class = rownames(out)
+    rownames(out) = c(1:nrow(out))
+    out[,c(2,1)]
+}
+v = unique(data_long$class)
+BDNF_N_class_shapiro  = shapiro_group(v, data_long, 'BDNF_N')
+BDNF_N_class_shapiro[BDNF_N_class_shapiro$shapiro_pv<0.05,]
+```
+
+From all 8 classes for BDNF_N gene ***4*** have non-parametric distribution: ***c-SC-m***,***t-CS-m***, ***t-SC-m***, ***t-CS-m***. This means that different dependencies in popultion could not be checked by one test - 4 of theme will be tested with parametric options, 4 others - by non-parametric ones. 
+
+
+Assign vectors of classes which will be tested by parametric or non-parametric method:
+
+```{r}
+par_vars = BDNF_N_class_shapiro[BDNF_N_class_shapiro$shapiro_pv>0.05,1]
+nonpar_vars = BDNF_N_class_shapiro[BDNF_N_class_shapiro$shapiro_pv<0.05,1]
+```
+
+```{r}
+#Make function for automatic statistical estimation (could be used for each gene and with parametric/non-parametric tests)
+cor_test <- function(vars, df, gene, test){
+    out = as.data.frame(matrix(ncol = 1, nrow = length(vars)), row.names = vars)
+    #colnames(out) = c('p,value', 'p.adjusted.holm', 'p.adjusted.BH')
+    colnames(out) = 'p.value'
+    df = df[df$name == gene,]
+    for (i in vars){
+        col_n = paste0('p.value_',i)
+        cur = df
+        cur[,6] = with(cur, ifelse(class == i,1,0))
+        if (test == 'parametric'){
+            out[i,1] = t.test(cur$value~cur$class)$p.value
+        } else {
+            out[i,1] = wilcox.test(cur$value~cur$class)$p.value
+        }
+        #out[i,2] = p.adjust(out[i,1], method = 'holm')
+        #out[i,3] = p.adjust(out[i,1], method = 'BH')
+    }
+    out$class = rownames(out)
+    rownames(out) = c(1:nrow(out))
+    out[,c(2,1)]
+}
+
+BDNF_N_class_t  = cor_test(v, data_long, 'BDNF_N', test = 'parametric')
+BDNF_N_class_t[BDNF_N_class_t$p.value<0.05,]
+
+BDNF_N_class_npar  = cor_test(nonpar_vars, data_long, 'BDNF_N', test = 'nonparametric')
+BDNF_N_class_npar[BDNF_N_class_npar$p.value<0.05,]
+```
+
+We see that ***only four*** groups have significant correlation between expression and class type: ***c-CS-m***, ***c-SC-m***, ***c-CS-s***, ***t-CS-s***. 
+
+***\* - Peculiarly, if t.test is launched without division on parametric and non-parametric classes, the statistics observes the same groups as stristically significant for the hypothesis.***
+
+Besides manual method, the reggression approach is also suitable here. We can build manually the linear regression model or even use ANOVA test (though, someone could say that MANOVA is more preferable here).
+
+## Task 3.
+
+Apparently, our data  - gene expression - ought to be tested by linear model, as type of variable is continuous. But if we remember the results of distribution tyoe tests and look at values, we see that, firstly, the majority of our variables is   NOT paametric and, secondly, values are not normilized (e.g. some genes have more than 3 times reater than ERBB4_N levels). Thus linear model on such a data would give invalid results and could not be reliable (see lower)
+
+```{r}
+#Data preparation:
+data_wo_na = na.omit(data2)
+
+ERBB4_N_glm = glm(ERBB4_N~., data = data_wo_na[,-c(1,2,80:83)], family = 'binomial')
+summary(ERBB4_N_glm)
+
+```
+
+The quality of our model is described by following parameters: **Null deviance**, **Residual deviance**, **AIC**.
+
+As we can see if only ERBB4_N is taken into account for its expression prediction, we have 92% of accuracy. However, if we consider other genes as predictors - the accuracy decreases till 12.5%, which signifies about poor model. If we even calculate p-value of Chi-square statistics (Null-Resildual deviances with 75 df [null df - res df]), we will come up with p-value=1.0000, which once more tells us about the bad quality of the model. And slightly high AIC metric also proves the previous statement.
+
+
+In comparison, linear model summary indicates about high quality of model as multiple R^2 (the proportion of response explained by predictors) is pretty high, 86% (even with number of observation correction, adjusted R^2). And overall p-value of model is far away from 0.05.
+
+## Task 4: PCA analysis
+
+To define division of our dataset, possible clusterization of genes into significant/not significant groups and uniqly deviate genes (probably, associated with disease) PCA method will be used. It simply shows the overall structure of dataset (herein only expression data will be analyzed) and make it clear associations of expression data and groups.
+
+```{r}
+#Make rda model and define on what component our data is expained by more than 70 %.
+
+genes_rda = rda(data_wo_na[,-c(1:2,80:83)], scale = T)
+screeplot(genes_rda, type = "lines", bstick = TRUE)
+summ_rda = summary(genes_rda)
+
+perc_count = 0
+i = 1
+while (perc_count <= 0.70){
+    perc_count = perc_count + summ_rda$cont$importance[2,i]
+    i =  i + 1
+}
+cat("Number of PCA, explaining at least 70 % of ditribution: ", i,"\n","Explained percent: ", perc_count)
+
+```
+
+We can see that from 6th component our dataset is eplained by more than 70%. However, to define which exact components represent our dataset division into groups, pairwise vizualisation of components should be provided. It could be approached as wuth basic R packages (biplot and data extraction) as with extensions as ggfortify and pca tool prcomp.
+
+PCA visualization and factor analysis provide an opportunity to determine more significant genes by factors' loadings and their vector of association. To achieve not only vectors but also values - prcomp function should implemented (princomp will also define vector with its strength). 
+
+
+PCA model construction and factor analysis:
+
+```{r}
+pca_fortify = prcomp(data_wo_na[,-c(1:2,80:83)], scale = T)
+
+autoplot(pca_fortify, data = data_wo_na[,-c(1:2,80:83)], loadings = T, loadings.label.size = 2, loadings.label = T, loadings.colour = 'lightseagreen', loadings.label.colour = 'violetred', alpha = 0)
+#components<-as.data.frame(scores(genes_rda, display = "species", choices = c(1:6), scaling = 0))
+#components
+```
+
+As we could see, in the case of our dataset there're slightly defined groups of genes, explaining more 1st or 2nd components, and the separate one, which shows neutral association with any of PCs. Lets see, which genes better explains PC1 and PC2.
+
+```{r}
+#Determine qunatiles of genes' distances from PC1:
+
+pc_g_contib = as.data.frame(scores(genes_rda, display = 'species', choices = c(1, 2), scaling = 'species', correlation = TRUE))
+
+quantile(abs(pc_g_contib$PC1))
+quantile(abs(pc_g_contib$PC2))
+
+#Show genes, lying from Q3 to Q4.
+
+```
+
+Herein, the absolute values of genes significance in the case of each component are higher than: 0.42 and 0.32, consequently. Next to determine which genes contibute mostly into PC1 - those with absolute factor loadings >= 0.42 and < 0.32 should be chosen. And for PC2 - with factor loadings >= 0.32 and < 0.42, consequently.
+
+```{r}
+#Extract PC1 significant genesL
+pc1_signif = pc_g_contib %>% abs() %>% subset(PC1 >= 0.42 & PC2 < 0.32)
+
+##And their indeed values:
+pc_g_contib[rownames(pc_g_contib) %in% rownames(pc1_signif),]
+
+#Extract PC2-significant genes:
+pc_g_contib %>% abs() %>% subset(PC2 >= 0.32 & PC1 < 0.42, select = PC2)
+##And their indeed values
+pc_g_contib[rownames(pc_g_contib) %in% rownames(pc1_signif),]
+```
+
+Hence, in our data we see that there are two groups specific to PC1 and PC2 components and others two, which have less strong association to components and our distribution. 
+
+Remembering rda summary we can notice that even first two components have weak contribution into our distribution - olky 46 %. Which increases by 0.1 % with PC3 (meaning it has a weak role).
+```{r}
+summ_rda$cont$importance[,1:6]
+```
+
+
+To see the clusterization of our data comparing with existing groups 3D visualization should be obtained (for explaination and taking into account the most representative data).
+
+For this plotly package serves as a good method. It's considered that we operate with 8 separate classes. However, gene contribution analysis revealed only two specific groups and two unsoecified ones. This seems peculiar and the cross-validation should be obtained. 
+
+```{r}
+#Prepare data for only PC1-3 visualization:
+pc3_data = prcomp(data_wo_na[,-c(1:2,80:83)], rank. = 3, scale = T)
+
+#Make dataset of loadings including existing classification of samples
+##Necessary for valid clusterization
+components <- as.data.frame(pc3_data[["x"]])
+components$PC2 <- -components$PC2 #necessary for dimension correct vis.
+components$PC3 <- -components$PC3 #the same as previous
+components <- cbind(components, data_wo_na$class)
+
+#Count the proportion of expanation of our distribution by 3 components
+tot_explained_variance_ratio <- summary(pc3_data)[["importance"]]['Proportion of Variance',1:3]
+tot_explained_variance_ratio <- 100 * sum(tot_explained_variance_ratio)
+
+tit = 'Total Explained Variance = 57.135'
+fig_pc <- plot_ly(components, x = ~PC1, y = ~PC2, z = ~PC3, color = ~data_wo_na$class) %>%
+ add_markers(size = 12)
+
+fig_pc <- fig_pc %>%
+ layout(
+     title = tit,
+     scene = list(bgcolor = "#e5ecf6")
+ )
+fig_pc
+```
+
+
+## Task 5. Differential expression analysis
+
+To conduct DESeq analysis data preparation should be implemented. Differential expression tests take two datasets for the analysis: expression levels in read resolution or count matrix in the case of samples/genes and description of sample-groups (wt, mut).
+
+```{r}
+#Count matrix conversion:
+
+count_df = pivot_longer(data_wo_na[,-c(1,2,80:82)], cols = -c(78))
+
+#Get the expression data for each gene from all repetitions:
+count_df_sum <- aggregate(formula = value ~ name + class, data = count_df, FUN = function (x) sum(x)*100) %>% pivot_wider(, id_cols = name, names_from = class, values_from = value)
+count_df$name = gsub(x = count_df$name,pattern = '_N',replacement = '')
+count_df2 = count_df %>% group_by(name, class) %>% mutate(idx = row_number()) %>% mutate(gene_rep = paste(name, idx, sep = '_')) %>% ungroup() %>% select(class, gene_rep, value)
+
+#Transform to matrix format
+count_df3 <- count_df2 %>% pivot_wider(id_cols = gene_rep, names_from = class, values_from = value) %>% as.data.frame()
+
+#Change NA and type of values to integer where necessary:
+count_wo_na = count_df3 %>% replace(is.na(.), 0)
+count_wo_na = as.data.frame(mutate_if(count_wo_na,is.numeric, as.integer))
+
+#Description data
+meta_df = as.data.frame(unique(data_wo_na[,80:83]))
+```
+
+```{r}
+#See diff. expr in groups of genotype: control vs disease
+dds_geno = DESeqDataSetFromMatrix(countData=count_wo_na, colData=meta_df, design=~Genotype, tidy = T)
+
+dds_g = DESeq(dds_geno)
+dds_res_g = na.omit(results(dds_g,tidy = T))
+na.omit(results(dds_g))
+
+#See diff. expr in groups of treatment: Saline vs Memantine
+dds_tr = DESeqDataSetFromMatrix(countData=count_wo_na, colData=meta_df, design=~Treatment, tidy = T)
+
+dds_t = DESeq(dds_tr)
+dds_res_t = na.omit(results(dds_t,tidy = T))
+na.omit(results(dds_t))
+
+#See diff. expr in groups of behavior:C/S vs S/C
+dds_bh = DESeqDataSetFromMatrix(countData=count_wo_na, colData=meta_df, design=~Behavior, tidy = T)
+
+dds_b = DESeq(dds_bh)
+dds_res_b = na.omit(results(dds_b,tidy = T))
+na.omit(results(dds_b))
+
+##Check p-values in all deseq sets:
+
+as.data.frame(summary(dds_res_t)[,6])
+
+as.data.frame(summary(dds_res_b)[,6])
+
+as.data.frame(summary(dds_res_g)[,6])
+
+```
+
+According to the results we could admit that in variable-specific datasets the expression of not all genes is affected by the conditions. 
+
+For instance, pvalue statistics tells that only in the case of treatment significant expression variance can be noticed. It was shown that the significant expression variance was obtained in the case of pCAMKII_N_63. This gene has two times increased expression (LFC = 2.4), signifying about its contribution under Memantine treatment. 
+
+However genotype-specific expression rate of this gene didn't change significantly (only LFC = 0.8).
+
+## Task 6. Data visualization with MCA and shrinkage
+```{r}
+# Data preparation:
+dds_res_t2 = results(dds_t, name = 'Treatment_Saline_vs_Memantine')
+dds_res_g2 = results(dds_g, name = 'Genotype_Ts65Dn_vs_Control')
+dds_res_b2 = results(dds_b, name = 'Behavior_S.C_vs_C.S')
+
+res_t_LFC = lfcShrink(dds_t, coef = 'Treatment_Saline_vs_Memantine',  type="apeglm")
+
+res_g_LFC = lfcShrink(dds_g, coef = 'Genotype_Ts65Dn_vs_Control',  type="apeglm")
+
+res_b_LFC = lfcShrink(dds_b, coef = 'Behavior_S.C_vs_C.S',  type="apeglm")
+```
+
+```{r}
+# Data visualization
+plotMA(res_t_LFC, main = 'LFC of genes in treatments groups')
+plotMA(res_g_LFC, main = 'LFC of genes in genotype groups')
+plotMA(res_b_LFC, main = 'LFC of genes in behavior groups')
+```
+
+To analyze the significance of our expression data it's better to check shrinkage LFC, being more sensitive to gene ranks (~principle components they explain). Indeed, we see that no significant deviations of gene expressions can be described. Neither in treatment, nor genotype and behavior groups.
+
+But that do not allow to reject any association between division groups. For the latter heatmap visualization could be obtained.
+
+```{r}
+#Data preparation and visualization (seems to be the same, as equal dependencies are checked):
+
+select_t <- order(rowMeans(counts(dds_t,normalized=TRUE)),decreasing=TRUE)[1:20]
+df_t <- as.data.frame(colData(dds_t)[,c("Treatment", "Genotype", "Behavior")])
+ntd_t <- normTransform(dds_t)
+pheatmap(assay(ntd_t)[select_t,], cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=FALSE, annotation_col=df_t, main = 'Heatmap of treatment data')
+
+select_g <- order(rowMeans(counts(dds_g,normalized=TRUE)),decreasing=TRUE)[1:20]
+df_g <- as.data.frame(colData(dds_g)[,c("Genotype", "Treatment", "Behavior")])
+ntd_g <- normTransform(dds_g)
+pheatmap(assay(ntd_g)[select_g,], cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=FALSE, annotation_col=df_g, main = 'Heatmap of genotype data')
+
+select_b <- order(rowMeans(counts(dds_b,normalized=TRUE)),decreasing=TRUE)[1:20]
+df_b <- as.data.frame(colData(dds_b)[,c("Behavior", "Genotype", "Treatment")])
+ntd_b <- normTransform(dds_b)
+pheatmap(assay(ntd_b)[select_b,], cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=FALSE, annotation_col=df_b, main = 'Heatmap of behavior data')
+```
+
+Here we see, that there is a significant correlation of gene expression when mice from control groups were treated with saline. They possess higher gene expression, comparing with mean one. In comparison, mice from disease-model group in most cases have lower gene expression rates, which, intriguingly, decrease after memantine treatment. 
+
+## Conclusion
+
+Overall, we can admit that some association could be recognised. And, definetly, memantine treatment decrease level of some genes under disease conditions. However, more precise information is necessary and the better quality, data representation, group distribution and volume should be obtained as with such results none significant differencial expression changings can be noticed. And group division is not accurate.
